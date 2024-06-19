@@ -227,54 +227,52 @@ def mask_nms(masks, scores, iou_thr=0.7, score_thr=0.1, inner_thr=0.2, **kwargs)
         selected_idx (torch.Tensor): A tensor representing the selected indices of the masks after NMS.
     """
 
+    # Sort scores and get the sorting indices
     scores, idx = scores.sort(0, descending=True)
+    masks_ord = masks[idx]
     num_masks = idx.shape[0]
     
-    masks_ord = masks[idx.view(-1), :]
-    masks_area = torch.sum(masks_ord, dim=(1, 2), dtype=torch.float)
+    # Calculate mask areas
+    masks_area = masks_ord.flatten(1).sum(1).float()
 
-    iou_matrix = torch.zeros((num_masks,) * 2, dtype=torch.float, device=masks.device)
-    inner_iou_matrix = torch.zeros((num_masks,) * 2, dtype=torch.float, device=masks.device)
-    for i in range(num_masks):
-        for j in range(i, num_masks):
-            intersection = torch.sum(torch.logical_and(masks_ord[i], masks_ord[j]), dtype=torch.float)
-            union = torch.sum(torch.logical_or(masks_ord[i], masks_ord[j]), dtype=torch.float)
-            iou = intersection / union
-            iou_matrix[i, j] = iou
-            # select mask pairs that may have a severe internal relationship
-            if intersection / masks_area[i] < 0.5 and intersection / masks_area[j] >= 0.85:
-                inner_iou = 1 - (intersection / masks_area[j]) * (intersection / masks_area[i])
-                inner_iou_matrix[i, j] = inner_iou
-            if intersection / masks_area[i] >= 0.85 and intersection / masks_area[j] < 0.5:
-                inner_iou = 1 - (intersection / masks_area[j]) * (intersection / masks_area[i])
-                inner_iou_matrix[j, i] = inner_iou
+    # Calculate intersection
+    intersection = (masks_ord[:, None] & masks_ord[None]).flatten(2).sum(2).float()
 
+    # Calculate union
+    union = (masks_ord[:, None] | masks_ord[None]).flatten(2).sum(2).float()
+
+    # Calculate IoU
+    iou_matrix = intersection / union
+
+    # Calculate inner IoU
+    inner_iou_matrix = torch.zeros_like(iou_matrix)
+    iou_conditions_1 = (intersection / masks_area[:, None] < 0.5) & (intersection / masks_area[None, :] >= 0.85)
+    iou_conditions_2 = (intersection / masks_area[:, None] >= 0.85) & (intersection / masks_area[None, :] < 0.5)
+    
+    inner_iou_matrix[iou_conditions_1] = 1 - (intersection[iou_conditions_1] / masks_area[iou_conditions_1[0]] * 
+                                              intersection[iou_conditions_1] / masks_area[iou_conditions_1[1]])
+    inner_iou_matrix[iou_conditions_2] = 1 - (intersection[iou_conditions_2] / masks_area[iou_conditions_2[0]] * 
+                                              intersection[iou_conditions_2] / masks_area[iou_conditions_2[1]])
+
+    # Set the diagonal to zero to avoid self comparisons
     iou_matrix.triu_(diagonal=1)
-    iou_max, _ = iou_matrix.max(dim=0)
-    inner_iou_matrix_u = torch.triu(inner_iou_matrix, diagonal=1)
-    inner_iou_max_u, _ = inner_iou_matrix_u.max(dim=0)
-    inner_iou_matrix_l = torch.tril(inner_iou_matrix, diagonal=1)
-    inner_iou_max_l, _ = inner_iou_matrix_l.max(dim=0)
-    
-    keep = iou_max <= iou_thr
-    keep_conf = scores > score_thr
-    keep_inner_u = inner_iou_max_u <= 1 - inner_thr
-    keep_inner_l = inner_iou_max_l <= 1 - inner_thr
-    
-    # If there are no masks with scores above threshold, the top 3 masks are selected
-    if keep_conf.sum() == 0:
-        index = scores.topk(3).indices
-        keep_conf[index, 0] = True
-    if keep_inner_u.sum() == 0:
-        index = scores.topk(3).indices
-        keep_inner_u[index, 0] = True
-    if keep_inner_l.sum() == 0:
-        index = scores.topk(3).indices
-        keep_inner_l[index, 0] = True
-    keep *= keep_conf
-    keep *= keep_inner_u
-    keep *= keep_inner_l
+    inner_iou_matrix.triu_(diagonal=1)
 
+    iou_max, _ = iou_matrix.max(dim=0)
+    inner_iou_max_u, _ = inner_iou_matrix.max(dim=0)
+
+    inner_iou_matrix.tril_(diagonal=-1)
+    inner_iou_max_l, _ = inner_iou_matrix.max(dim=0)
+
+    # Determine which masks to keep based on IoU and inner IoU thresholds
+    keep = (iou_max <= iou_thr) & (scores > score_thr) & (inner_iou_max_u <= 1 - inner_thr) & (inner_iou_max_l <= 1 - inner_thr)
+
+    # If no masks are kept, select the top 3 masks by score
+    if keep.sum() == 0:
+        topk_idx = scores.topk(3).indices
+        keep[topk_idx] = True
+
+    # Return the indices of the masks to keep
     selected_idx = idx[keep]
     return selected_idx
 
